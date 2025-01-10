@@ -122,7 +122,7 @@ func (s *Server) AddDataHandler(w http.ResponseWriter, r *http.Request) {
 		resp, err := s.api.Process("提取视频字幕，在一行内输出，原始语言保持不变", url)
 		if err != nil {
 			log.Printf("Failed to process: %v", err)
-			s.setFirestoreDocFailed(doc_id, err)
+			s.setFirestoreDocFailed(doc_id, data, err)
 			return
 		}
 		var caption Response
@@ -133,7 +133,7 @@ func (s *Server) AddDataHandler(w http.ResponseWriter, r *http.Request) {
 		match_rules, err := s.db.GetDocument(game, "match")
 		if err != nil {
 			log.Printf("Failed to get match rules: %v", err)
-			s.setFirestoreDocFailed(doc_id, err)
+			s.setFirestoreDocFailed(doc_id, data, err)
 			return
 		}
 		// 执行匹配逻辑
@@ -156,7 +156,7 @@ func (s *Server) AddDataHandler(w http.ResponseWriter, r *http.Request) {
 				resp, err := s.api.Process(p, url)
 				if err != nil {
 					log.Printf("Failed to process: %v", err)
-					s.setFirestoreDocFailed(doc_id, err)
+					s.setFirestoreDocFailed(doc_id, data, err)
 					return
 				}
 				var resp_1 Response
@@ -196,11 +196,9 @@ func splitString(s string) []string {
 }
 
 // create a func, set firestore doc , status failed
-func (s *Server) setFirestoreDocFailed(docID string, err error) {
-	data := map[string]interface{}{
-		"status": "failed",
-		"error":  err.Error(),
-	}
+func (s *Server) setFirestoreDocFailed(docID string, data map[string]interface{}, err error) {
+	data["status"] = "failed"
+	data["error"] = err.Error()
 	s.db.SetDocument("videolabel", docID, data)
 }
 
