@@ -1,31 +1,30 @@
 package server
 
 import (
-	"io"
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
-func TestHandler(t *testing.T) {
+func TestAddDataHandler(t *testing.T) {
 	s := &Server{}
-	server := httptest.NewServer(http.HandlerFunc(s.HelloWorldHandler))
+	server := httptest.NewServer(http.HandlerFunc(s.AddDataHandler))
 	defer server.Close()
-	resp, err := http.Get(server.URL)
+	// resp, err := http.Get(server.URL)
+	data := map[string]interface{}{
+		"name": "John Doe",
+		"age":  31,
+	}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("error marshaling JSON data. Err: %v", err)
+	}
+	resp, err := http.Post(server.URL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		t.Fatalf("error making request to server. Err: %v", err)
 	}
+	t.Log(resp.Body)
 	defer resp.Body.Close()
-	// Assertions
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected status OK; got %v", resp.Status)
-	}
-	expected := "{\"message\":\"Hello World\"}"
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("error reading response body. Err: %v", err)
-	}
-	if expected != string(body) {
-		t.Errorf("expected response body to be %v; got %v", expected, string(body))
-	}
 }

@@ -10,12 +10,14 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 
 	"lilith-label-go/internal/database"
+	"lilith-label-go/internal/process"
 )
 
 type Server struct {
 	port int
 
-	db database.Service
+	db  database.Service
+	api process.Service
 }
 
 func NewServer() *http.Server {
@@ -23,7 +25,8 @@ func NewServer() *http.Server {
 	NewServer := &Server{
 		port: port,
 
-		db: database.New(),
+		db:  database.New(),
+		api: process.New(),
 	}
 
 	// Declare Server config
