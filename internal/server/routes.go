@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -14,33 +16,37 @@ type Response struct {
 	Label string `json:"label"`
 }
 
+type DocData struct {
+	Status    string                 `json:"status"`
+	Labels    []string               `json:"labels"`
+	Date      string                 `json:"date"`
+	SpendTime string                 `json:"spend_time"`
+	Error     string                 `json:"error,omitempty"`
+	Game      string                 `json:"game"`
+	URL       string                 `json:"url"`
+	Lang      string                 `json:"lang"`
+	MsgID     string                 `json:"msg_id,omitempty"`
+	Other     map[string]interface{} `json:"-"` // 忽略其他字段
+}
+
 func (s *Server) RegisterRoutes() http.Handler {
 	mux := http.NewServeMux()
-
-	// Register routes
 	mux.HandleFunc("/", s.GetMsgHandler)
-
 	mux.HandleFunc("/labels", s.AddDataHandler)
-
-	// Wrap the mux with CORS middleware
 	return s.corsMiddleware(mux)
 }
 
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Set CORS headers
-		w.Header().Set("Access-Control-Allow-Origin", "*") // Replace "*" with specific origins if needed
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
 		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
-		w.Header().Set("Access-Control-Allow-Credentials", "false") // Set to "true" if credentials are required
+		w.Header().Set("Access-Control-Allow-Credentials", "false")
 
-		// Handle preflight OPTIONS requests
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-
-		// Proceed with the next handler
 		next.ServeHTTP(w, r)
 	})
 }
@@ -48,177 +54,342 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 func (s *Server) GetMsgHandler(w http.ResponseWriter, r *http.Request) {
 	msgID := r.URL.Query().Get("msg_id")
 	if msgID == "" {
-		http.Error(w, "Missing msg_id parameter", http.StatusBadRequest)
+		s.respondWithError(w, http.StatusBadRequest, "Missing msg_id parameter")
 		return
 	}
-
-	resp, _ := s.db.GetDocument("videolabel", msgID)
-
-	jsonResp, err := json.Marshal(resp)
+	resp, err := s.db.GetDocument("videolabel", msgID)
 	if err != nil {
-		http.Error(w, "Failed to marshal response", http.StatusInternalServerError)
+		s.respondWithError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get document: %v", err))
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if _, err := w.Write(jsonResp); err != nil {
-		log.Printf("Failed to write response: %v", err)
-	}
+	s.respondWithJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) AddDataHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.respondWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
-	// 读取请求体
+	// 读取并解析请求体
+	docData, err := s.parseRequestData(r)
+	if err != nil {
+		s.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 添加数据到数据库并获取文档 ID
+	docData.Status = "queued"
+	resp, err := s.db.AddData("videolabel", docData)
+	if err != nil {
+		s.respondWithError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add data: %v", err))
+		return
+	}
+	docData.MsgID = resp["msg_id"]
+
+	s.respondWithJSON(w, http.StatusCreated, resp)
+
+	// 启动异步处理
+	go s.processDataAsync(docData)
+}
+
+// 解析请求体并返回 DocData
+func (s *Server) parseRequestData(r *http.Request) (*DocData, error) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
+		return nil, errors.New("failed to read request body")
 	}
 	defer r.Body.Close()
 
-	// 解析 JSON 数据
 	var data map[string]interface{}
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		http.Error(w, "Failed to unmarshal request body", http.StatusBadRequest)
-		return
-	}
-	data["status"] = "queued"
-
-	// 使用从请求中获取的数据设置文档
-	resp, err := s.db.AddData("videolabel", data)
-	if err != nil {
-		http.Error(w, "Failed to add data", http.StatusInternalServerError)
-		return
-	}
-	doc_id := resp["msg_id"]
-
-	jsonResp, err := json.Marshal(resp)
-	if err != nil {
-		http.Error(w, "Failed to marshal set document response", http.StatusInternalServerError)
-		return
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, errors.New("failed to unmarshal request body")
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if _, err := w.Write(jsonResp); err != nil {
-		log.Printf("Failed to write response: %v", err)
+	docData := &DocData{
+		Other: make(map[string]interface{}),
 	}
 
-	// 异步处理请求
-	go func() {
-		start := time.Now() //开始时间
-		var totalLabels []string
-		log.Printf("异步处理: %s", doc_id)
+	if game, ok := data["game"].(string); ok {
+		docData.Game = game
+	} else {
+		return nil, errors.New("invalid 'game' field")
+	}
+	if url, ok := data["url"].(string); ok {
+		docData.URL = url
+	} else {
+		return nil, errors.New("invalid 'url' field")
+	}
+	if lang, ok := data["lang"].(string); ok {
+		docData.Lang = lang
+	} else {
+		return nil, errors.New("invalid 'lang' field")
+	}
 
-		game := data["game"].(string)
-		url := data["url"].(string)
-		log.Println(game, url)
-
-		//获取视频字幕
-		resp, err := s.api.Process("提取视频字幕，在一行内输出，原始语言保持不变", url)
-		if err != nil {
-			log.Printf("Failed to process: %v", err)
-			s.setFirestoreDocFailed(doc_id, data, err)
-			return
+	for k, v := range data {
+		if k != "game" && k != "url" && k != "lang" {
+			docData.Other[k] = v
 		}
-		var caption Response
-		json.Unmarshal([]byte(resp), &caption)
-		log.Println(caption.Label)
+	}
 
-		// 从firestore获取游戏match规则
-		match_rules, err := s.db.GetDocument(game, "match")
-		if err != nil {
-			log.Printf("Failed to get match rules: %v", err)
-			s.setFirestoreDocFailed(doc_id, data, err)
-			return
-		}
-		// 执行匹配逻辑
-		match_results := processCaption(caption.Label, match_rules)
-		totalLabels = append(totalLabels, match_results...)
-
-		// 从firestore获取游戏对应prompt
-		prompts, err := s.db.GetDocument(game, "prompt")
-		if err != nil {
-			log.Printf("Failed to get prompt: %v", err)
-		}
-
-		// 调用Gemini接口
-		var wg sync.WaitGroup
-		wg.Add(len(prompts))
-		for _, v := range prompts {
-			prompt := v.(string)
-			go func(p string) {
-				defer wg.Done()
-				resp, err := s.api.Process(p, url)
-				if err != nil {
-					log.Printf("Failed to process: %v", err)
-					s.setFirestoreDocFailed(doc_id, data, err)
-					return
-				}
-				var resp_1 Response
-				json.Unmarshal([]byte(resp), &resp_1)
-				for _, v := range splitString(resp_1.Label) {
-					if v != "other" {
-						totalLabels = append(totalLabels, v)
-					}
-				}
-				log.Printf("Prompt: %s, Label: %s", p, resp_1.Label)
-			}(prompt)
-		}
-		wg.Wait()
-
-		//处理完写入数据到Firestore
-		data["status"] = "done"
-		data["labels"] = totalLabels
-		//当前时间，格式为2025-01-10 16:27:00
-		currentTime := time.Now().Format("2006-01-02 15:04:05")
-		data["date"] = currentTime
-		end := time.Now() //结束时间
-		spend_time := end.Sub(start)
-		data["spend_time"] = spend_time.String()
-		log.Printf("处理耗时: %v", spend_time)
-		s.db.SetDocument("videolabel", doc_id, data)
-		log.Println(data)
-		log.Println("处理完成")
-	}()
+	return docData, nil
 }
 
-// create a func , split string by comma ,return []string
+// 异步处理数据
+func (s *Server) processDataAsync(docData *DocData) {
+	start := time.Now()
+	log.Printf("异步处理开始: %s", docData.MsgID)
+
+	// 1. 获取视频字幕
+	log.Println("1. 获取视频字幕")
+	caption, err := s.fetchCaption(docData.URL)
+	if err != nil {
+		s.setFirestoreDocFailed(docData, err)
+		return
+	}
+	log.Println(caption)
+
+	// 2. 执行匹配逻辑
+	log.Println("2. 执行匹配逻辑")
+	totalLabels, err := s.executeMatchingLogic(docData.Game, caption)
+	if err != nil {
+		s.setFirestoreDocFailed(docData, err)
+		return
+	}
+	log.Println(totalLabels)
+
+	// 3. 获取和处理 Text prompts
+	log.Println("3. 获取和处理 Text prompts")
+	textLabels, err := s.processTextPrompts(docData.Game, docData.Lang, caption)
+	if err != nil {
+		s.setFirestoreDocFailed(docData, err)
+		return
+	}
+	totalLabels = append(totalLabels, textLabels...)
+	log.Println(totalLabels)
+
+	// 4. 获取和处理 Video Prompts
+	log.Println("4. 获取和处理 Video Prompts")
+	videoLabels, err := s.processVideoPrompts(docData.Game, docData.Lang, docData.URL)
+	if err != nil {
+		s.setFirestoreDocFailed(docData, err)
+		return
+	}
+	totalLabels = append(totalLabels, videoLabels...)
+	log.Println(totalLabels)
+
+	// 5. 更新 Firestore 文档
+	log.Println("5. 更新 Firestore 文档")
+	docData.Status = "done"
+	docData.Labels = totalLabels
+	docData.Date = time.Now().Format("2006-01-02 15:04:05")
+	docData.SpendTime = time.Since(start).String()
+
+	if err := s.updateFirestoreDocument(docData); err != nil {
+		log.Printf("Failed to update Firestore document: %v", err)
+	}
+
+	log.Printf("异步处理完成: %s, 耗时: %s", docData.MsgID, docData.SpendTime)
+
+}
+
+// 获取视频字幕
+func (s *Server) fetchCaption(url string) (string, error) {
+	resp, err := s.api.ProcessURL("获取视频脚本，加上标点符号后在一行内输出，原始语言保持不变", url)
+	if err != nil {
+		return "", fmt.Errorf("failed to process URL: %w", err)
+	}
+	var caption Response
+	if err := json.Unmarshal([]byte(resp), &caption); err != nil {
+		return "", fmt.Errorf("failed to unmarshal caption: %w", err)
+	}
+	return strings.ToLower(caption.Label), nil
+}
+
+// 执行匹配逻辑
+func (s *Server) executeMatchingLogic(game string, caption string) ([]string, error) {
+	matchRules, err := s.db.ListDocuments(fmt.Sprintf("%s_match", game))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get match rules: %w", err)
+	}
+
+	var totalLabels []string
+	for _, v := range matchRules {
+		label, ok := v["label"].(string)
+		if !ok {
+			log.Printf("label is not a string: %v", v["label"])
+			continue
+		}
+		rules, ok := v["match_rules"].([]interface{})
+		if !ok {
+			log.Printf("match_rules is not an array: %v", v["match_rules"])
+			continue
+		}
+		for _, r := range rules {
+			if strings.Contains(caption, r.(string)) {
+				totalLabels = append(totalLabels, label)
+			}
+		}
+	}
+	return totalLabels, nil
+}
+
+// 处理 Text prompts
+func (s *Server) processTextPrompts(game, lang, caption string) ([]string, error) {
+	textPrompts, err := s.db.ListDocuments(fmt.Sprintf("%s_%s_text_prompts", game, lang))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get text prompts: %w", err)
+	}
+
+	var totalLabels []string
+	var wg sync.WaitGroup
+	wg.Add(len(textPrompts))
+
+	labelChan := make(chan string, len(textPrompts))
+
+	for _, v := range textPrompts {
+		prompt, ok := v["content"].(string)
+		if !ok {
+			log.Printf("prompt is not a string: %v", v["content"])
+			continue
+		}
+		go func(p string) {
+			defer wg.Done()
+			resp, err := s.api.ProcessCaption(p, caption)
+			if err != nil {
+				log.Printf("Failed to process caption: %v", err)
+				return
+			}
+			var resp_1 Response
+			if err := json.Unmarshal([]byte(resp), &resp_1); err != nil {
+				log.Printf("Failed to unmarshal response: %v", err)
+				return
+			}
+			if resp_1.Label != "other" {
+				labelChan <- resp_1.Label
+			}
+			log.Printf("Text Prompt: %s, Label: %s", p, resp_1.Label)
+		}(prompt)
+	}
+	wg.Wait()
+	close(labelChan)
+	for label := range labelChan {
+		totalLabels = append(totalLabels, label)
+	}
+	return totalLabels, nil
+}
+
+// 处理 Video Prompts
+func (s *Server) processVideoPrompts(game, lang, url string) ([]string, error) {
+	videoPrompts, err := s.db.ListDocuments(fmt.Sprintf("%s_%s_video_prompts", game, lang))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get video prompts: %w", err)
+	}
+
+	var totalLabels []string
+	var wg sync.WaitGroup
+	wg.Add(len(videoPrompts))
+
+	labelChan := make(chan []string, len(videoPrompts))
+
+	for _, v := range videoPrompts {
+		videoPrompt, ok := v["content"].(string)
+		if !ok {
+			log.Printf("prompt is not a string: %v", v["content"])
+			continue
+		}
+		go func(p string) {
+			defer wg.Done()
+			resp, err := s.api.ProcessURL(p, url)
+			if err != nil {
+				log.Printf("Failed to process URL: %v", err)
+				return
+			}
+			var resp_1 Response
+			if err := json.Unmarshal([]byte(resp), &resp_1); err != nil {
+				log.Printf("Failed to unmarshal response: %v", err)
+				return
+			}
+
+			labels := splitString(resp_1.Label)
+			var filteredLabels []string
+			for _, v := range labels {
+				if v != "other" {
+					filteredLabels = append(filteredLabels, v)
+				}
+			}
+			labelChan <- filteredLabels
+			log.Printf("Video Prompt: %s, Label: %s", p, resp_1.Label)
+
+		}(videoPrompt)
+	}
+
+	wg.Wait()
+	close(labelChan)
+	for labels := range labelChan {
+		totalLabels = append(totalLabels, labels...)
+	}
+
+	return totalLabels, nil
+}
+
+// 更新 Firestore 文档
+func (s *Server) updateFirestoreDocument(docData *DocData) error {
+	updatedData := map[string]interface{}{
+		"status":     docData.Status,
+		"labels":     docData.Labels,
+		"date":       docData.Date,
+		"spend_time": docData.SpendTime,
+		"game":       docData.Game,
+		"url":        docData.URL,
+		"lang":       docData.Lang,
+	}
+	if docData.Error != "" {
+		updatedData["error"] = docData.Error
+	}
+	for k, v := range docData.Other {
+		updatedData[k] = v
+	}
+
+	_, err := s.db.SetDocument("videolabel", docData.MsgID, updatedData)
+	if err != nil {
+		return fmt.Errorf("failed to set document: %w", err)
+	}
+	return nil
+}
+
+// 设置 Firestore 文档状态为失败
+func (s *Server) setFirestoreDocFailed(docData *DocData, err error) {
+	docData.Status = "failed"
+	docData.Error = err.Error()
+	if updateErr := s.updateFirestoreDocument(docData); updateErr != nil {
+		log.Printf("Failed to update Firestore document with error: %v, original error: %v", updateErr, err)
+	}
+}
+
+// 响应 JSON 数据
+func (s *Server) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("Failed to encode response: %v", err)
+	}
+}
+
+// 响应错误信息
+func (s *Server) respondWithError(w http.ResponseWriter, statusCode int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	resp := map[string]string{"error": message}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("Failed to encode error response: %v", err)
+	}
+}
+
 func splitString(s string) []string {
 	if s == "" {
 		return []string{}
 	}
 	return strings.Split(s, ",")
-}
-
-// create a func, set firestore doc , status failed
-func (s *Server) setFirestoreDocFailed(docID string, data map[string]interface{}, err error) {
-	data["status"] = "failed"
-	data["error"] = err.Error()
-	s.db.SetDocument("videolabel", docID, data)
-}
-
-func processCaption(caption string, match_rules map[string]interface{}) []string {
-	totalLabels := []string{}
-
-	for k, v := range match_rules {
-		if vs, ok := v.(string); ok {
-			// 使用逗号分割字符串
-			values := strings.Split(vs, ",")
-			for _, singleValue := range values {
-				// 去除首尾空格
-				trimmedValue := strings.TrimSpace(singleValue)
-				if trimmedValue != "" && strings.Contains(caption, trimmedValue) {
-					totalLabels = append(totalLabels, k)
-					goto NextRule
-				}
-			}
-		}
-	NextRule:
-	}
-	return totalLabels
 }

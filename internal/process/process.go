@@ -11,7 +11,8 @@ import (
 )
 
 type Service interface {
-	Process(prompt, url string) (string, error)
+	ProcessURL(prompt, url string) (string, error)
+	ProcessCaption(prompt, caption string) (string, error)
 }
 
 type service struct {
@@ -39,7 +40,7 @@ func New() Service {
 	return &service{client: client}
 }
 
-func (s *service) Process(prompt, url string) (string, error) {
+func (s *service) ProcessURL(prompt, url string) (string, error) {
 	s.client.ResponseMIMEType = "application/json"
 	s.client.ResponseSchema = &genai.Schema{
 		Type: genai.TypeObject, Properties: map[string]*genai.Schema{
@@ -49,6 +50,24 @@ func (s *service) Process(prompt, url string) (string, error) {
 	resp, err := s.client.Invoke(
 		&mygenai.TextInput{Text: prompt},
 		&mygenai.BlobInput{Path: url},
+	)
+	if err != nil {
+		log.Printf("failed invoke: %v", err)
+		return "", fmt.Errorf("failed to invoke Gemini API: %w", err)
+	}
+	return resp, nil
+}
+
+func (s *service) ProcessCaption(prompt, caption string) (string, error) {
+	s.client.ResponseMIMEType = "application/json"
+	s.client.ResponseSchema = &genai.Schema{
+		Type: genai.TypeObject, Properties: map[string]*genai.Schema{
+			"label": {Type: genai.TypeString},
+		},
+	}
+	resp, err := s.client.Invoke(
+		&mygenai.TextInput{Text: prompt},
+		&mygenai.TextInput{Text: caption},
 	)
 	if err != nil {
 		log.Printf("failed invoke: %v", err)

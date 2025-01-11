@@ -33,3 +33,4 @@ main
 .DS_Store
 
 dist
+testdata
